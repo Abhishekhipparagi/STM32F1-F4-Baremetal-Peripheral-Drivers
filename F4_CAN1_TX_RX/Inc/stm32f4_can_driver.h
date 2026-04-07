@@ -1,0 +1,139 @@
+/*
+ * stm32f4_can_driver.h — CAN1 driver for STM32F446RE, bare metal
+ *
+ * Pin mapping:
+ *   PB8 = CAN1_RX  (AF9, input pull-up)
+ *   PB9 = CAN1_TX  (AF9, push-pull)
+ *
+ *   PB8/PB9 are on the Arduino headers (D15/D14 on Nucleo CN5),
+ *   easy access for breadboards. The OTHER CAN1 mapping is PA11/PA12
+ *   (AF9, on the Morpho header) but that conflicts with USB OTG FS.
+ *   Stick with PB8/PB9 unless you need the Morpho pins.
+ *
+ * CAN1 sits on APB1 = 45 MHz (when SYSCLK = 180 MHz).
+ *
+ * 500 kbps default: BRP=18, TS1=2, TS2=2, SJW=1
+ *   bit time = (1 + 2 + 2) * (18/45MHz) = 5 * 400 ns = 2 us -> 500 kbps
+ *   sample point = (1 + 2) / (1 + 2 + 2) = 60%
+ *
+ *   60% is on the lower end of the usual range. The standard "safe"
+ *   value is 87.5%, but the numbers above are what the working HAL
+ *   reference used and I kept them so the timing matches a known-good
+ *   config exactly. If you want 87.5%, try BRP=5, TS1=15, TS2=2.
+ *
+ * F446 has BOTH CAN1 and CAN2 sharing one filter bank pool (28 banks).
+ * The split point is configurable via CAN2SB in FMR. We set it to 20,
+ * so banks 0-19 belong to CAN1 and 20-27 to CAN2. This driver uses
+ * filter bank 18 for the accept-all rule (any bank in CAN1's range
+ * works, 18 matches the tested reference config).
+ *
+ * Same public API as the F1 CAN driver — only the .c implementation
+ * differs. Drop-in compatible at the source level.
+ *
+ * A CAN transceiver chip (MCP2551, SN65HVD230, TJA1050) is REQUIRED
+ * between the MCU and the bus. And there must be at least one OTHER
+ * node on the bus to ACK frames, or every TX fails -> bus-off.
+ *
+ * Author: Abhishek Hipparagi
+ */
+
+#ifndef STM32F4_CAN_DRIVER_H
+#define STM32F4_CAN_DRIVER_H
+
+#include "stm32f4xx.h"
+#include <stdint.h>
+
+// --- status / enums ---
+
+typedef enum {
+    CAN_OK      = 0x00,
+    CAN_ERROR   = 0x01,
+    CAN_TIMEOUT = 0x02
+} CAN_Status_t;
+
+// operating mode -- maps to LBKM/SILM bits in BTR
+typedef enum {
+    CAN_MODE_NORMAL          = 0x00,   // TX + RX on physical bus
+    CAN_MODE_LOOPBACK        = 0x01,   // TX looped back internally, no bus needed
+    CAN_MODE_SILENT          = 0x02,   // listen only, no TX
+    CAN_MODE_SILENT_LOOPBACK = 0x03    // self-test, no bus activity
+} CAN_Mode_t;
+
+// IDE / RTR bit values match register positions in TIR/RIR
+#define CAN_ID_STD       0x00U          // standard 11-bit identifier
+#define CAN_ID_EXT       0x04U          // extended 29-bit identifier
+#define CAN_RTR_DATA     0x00000000U    // data frame (carries payload)
+#define CAN_RTR_REMOTE   0x00000002U    // remote frame (request, no payload)
+
+#define CAN_RX_FIFO0     0x00U
+#define CAN_RX_FIFO1     0x01U
+
+// --- bit timing config ---
+//
+// register fields are stored as (actual_value - 1), see CAN_Init().
+// see GetDefault500kConfig() for the standard 500 kbps numbers.
+typedef struct {
+    uint32_t   prescaler;   // BRP, 1-1024
+    uint8_t    ts1;         // TS1 (Prop_Seg + Phase_Seg1), 1-16
+    uint8_t    ts2;         // TS2 (Phase_Seg2), 1-8
+    uint8_t    sjw;         // SJW, 1-4
+    CAN_Mode_t mode;
+} CAN_Config_t;
+
+// --- TX / RX message headers ---
+//
+// fill TxHeader before calling CAN_Transmit. Driver fills RxHeader.
+typedef struct {
+    uint32_t std_id;        // 11-bit, used when ide == CAN_ID_STD
+    uint32_t ext_id;        // 29-bit, used when ide == CAN_ID_EXT
+    uint32_t ide;           // CAN_ID_STD or CAN_ID_EXT
+    uint32_t rtr;           // CAN_RTR_DATA or CAN_RTR_REMOTE
+    uint32_t dlc;           // 0-8 data bytes
+} CAN_TxHeader_t;
+
+typedef struct {
+    uint32_t std_id;
+    uint32_t ext_id;
+    uint32_t ide;
+    uint32_t rtr;
+    uint32_t dlc;
+    uint32_t timestamp;
+    uint32_t filter_match_index;
+} CAN_RxHeader_t;
+
+// optional RX callback — driver's ISR calls this when a frame arrives
+// keep it short, no delays, no blocking work
+typedef void (*CAN_RxCallback_t)(CAN_RxHeader_t *header, uint8_t *data);
+
+// --- API ---
+
+// init CAN1 (GPIO + bit timing). Stays in init mode until CAN_Start().
+CAN_Status_t CAN1_Init(const CAN_Config_t *cfg);
+
+// fill cfg with the tested 500 kbps numbers (BRP=18, TS1=2, TS2=2)
+void CAN1_GetDefault500kConfig(CAN_Config_t *cfg);
+
+// configure filter bank 18 to accept ALL frames into the given FIFO.
+// also sets the CAN1/CAN2 filter split (CAN2SB = 20).
+void CAN1_Filter_AcceptAll(uint8_t fifo);
+
+// exit init mode (join the bus) and enable the FIFO0 RX interrupt
+CAN_Status_t CAN1_Start(void);
+
+// register a callback that the driver's ISR will invoke on every
+// data frame in FIFO0. Pass NULL to disable.
+void CAN1_RegisterRxCallback(CAN_RxCallback_t cb);
+
+// queue a frame for transmission. Returns CAN_OK if accepted by a
+// mailbox, CAN_ERROR if all 3 mailboxes are full.
+CAN_Status_t CAN1_Transmit(const CAN_TxHeader_t *header,
+                           const uint8_t *data,
+                           uint32_t *mailbox);
+
+// pull one frame out of the given FIFO. Polling-mode alternative
+// to using the callback. Returns CAN_OK if a message was read.
+CAN_Status_t CAN1_Receive(uint32_t fifo,
+                          CAN_RxHeader_t *header,
+                          uint8_t *data);
+
+#endif /* STM32F4_CAN_DRIVER_H */
