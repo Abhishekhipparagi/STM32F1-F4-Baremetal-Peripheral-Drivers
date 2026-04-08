@@ -1,96 +1,160 @@
-# F1_RCC_Clock_Config
+# F1 USART2 TX/RX — Bare Metal
 
-Bare-metal RCC clock configuration for STM32F103C6 (Blue Pill). Configures the system clock to 72 MHz using HSE + PLL, all at register level — no HAL.
-
-## What it does
-
-Sets up the full clock tree:
-
-```
-HSE(8MHz) → PLL(×9) → SYSCLK(72MHz) → AHB(÷1) → HCLK(72MHz)
-                                        ├→ APB1(÷2) → PCLK1(36MHz)
-                                        └→ APB2(÷1) → PCLK2(72MHz)
-```
-
-Outputs PLL/2 on the MCO pin (PA8) so you can verify the clock with a scope, and blinks the onboard LED (PC13) at 1 Hz as a quick sanity check.
+USART2 driver for STM32F103 Blue Pill. TX polling, RX interrupt-driven with a 128-byte ring buffer. Classic loopback echo demo — type into a terminal and the board types back. No HAL.
 
 ## Hardware
 
-- STM32F103C6T6 Blue Pill
-- 8 MHz crystal on OSC_IN/OSC_OUT
+- **Board:** Blue Pill (STM32F103C8T6 / C6T6)
+- **MCU:** Cortex-M3 @ 72 MHz
+- **USART2:** PA2 = TX, PA3 = RX
+- **Baud:** 9600 8N1
+- **LED:** PC13 (onboard, active LOW)
+
+USART2 lives on APB1 = 36 MHz, so that's what goes into the BRR calculation.
+
+```
++----------+        +----------+
+| STM32    |        | USB-TTL  |
+|   PA2 ---+--TX--->| RX       |
+|   PA3 <--+--RX----| TX       |
+|   GND  --+--------+ GND      |
++----------+        +----------+
+```
+
+Standard USB-to-serial adapter. Make sure the adapter is 3.3 V tolerant or use level shifting. PC13 on the onboard LED toggles on every received byte so you can see RX is actually firing even before you look at the terminal.
 
 ## Files
 
 ```
 Inc/
-  stm32f1_rcc_driver.h    — driver header (config struct, enums, API)
+  stm32f1_rcc_driver.h
+  stm32f1_uart_driver.h
 Src/
-  stm32f1_rcc_driver.c    — driver implementation
-  main.c                  — example usage
+  stm32f1_rcc_driver.c
+  stm32f1_uart_driver.c
+  main.c
 ```
+
+Pulls in the RCC driver from `F1_RCC_Clock_Config` to set up the 72 MHz clock tree.
+
+## BRR math (9600 baud)
+
+```
+APB1 = 36 MHz
+USARTDIV = 36,000,000 / (16 * 9600) = 234.375
+
+mantissa = 234       (register bits [15:4])
+fraction = 0.375 * 16 = 6    (register bits [3:0])
+
+BRR = (234 << 4) | 6 = 0x0EA6
+```
+
+Integer-only math, no floats. The driver computes this at init time from whatever baud you pass in — so changing rate is just a parameter, not a register edit.
 
 ## Driver API
 
 ```c
-// quickest way — hardcoded 72 MHz, same sequence tested on hardware
-RCC_SystemClock_Config_72MHz();
+void    UART2_Init(uint32_t baudrate);
 
-// or use the config struct for custom setups
-RCC_ClkConfig_t clk;
-RCC_GetDefault72MHzConfig(&clk);
-RCC_Init(&clk);
+void    UART2_SendChar(char c);           // blocking TX
+void    UART2_SendString(const char *str);
 
-// fallback if crystal is missing
-RCC_SystemClock_Config_HSI();
-
-// MCO output on PA8 for scope verification
-RCC_MCO_Init(RCC_MCO_PLL_DIV2);
-
-// read back actual frequencies from registers
-uint32_t freq = RCC_GetSysClockFreq();  // 72000000
-uint32_t apb1 = RCC_GetPCLK1Freq();    // 36000000
+uint8_t UART2_DataAvailable(void);         // check ring buffer
+uint8_t UART2_GetChar(void);               // pull one byte
 ```
 
-## Clock config sequence
+TX is polling — the driver waits on `TXE` (DR empty), writes, then waits on `TC` (byte fully on the wire). RX is interrupt-driven — the driver's `USART2_IRQHandler` reads DR on `RXNE` and pushes the byte into a 128-byte ring buffer. Main loop polls `DataAvailable()` and pulls bytes out with `GetChar()`.
 
-Order matters — get it wrong and the chip hard faults or hangs:
+## Usage
 
-1. Enable HSI, switch to it (safe fallback)
-2. Enable HSE, wait for HSERDY
-3. Set flash wait states (2 WS for 72 MHz) — **before** increasing clock
-4. Configure PLL source (HSE) and multiplier (×9) — PLL must be OFF
-5. Enable PLL, wait for PLLRDY
-6. Set bus prescalers (AHB ÷1, APB1 ÷2, APB2 ÷1)
-7. Switch SYSCLK to PLL, confirm via SWS bits
+```c
+RCC_SystemClock_Config_72MHz();
+UART2_Init(9600);
 
-If you switch to PLL before setting flash latency, the CPU reads garbage from flash and crashes. Found that out the hard way.
+UART2_SendString("Hello\r\n");
 
-## MCO pin limitation
+while (1) {
+    if (UART2_DataAvailable()) {
+        char c = UART2_GetChar();
+        UART2_SendChar(c);         // echo
+    }
+}
+```
 
-The MCO output on PA8 is configured at 50 MHz GPIO speed, but in practice the pin's slew rate can't cleanly reproduce signals much above ~15 MHz. At higher frequencies you'll see a triangle wave instead of a square wave on the scope.
+## How it works
 
-That's why PLL/2 (36 MHz) is used instead of SYSCLK directly — even 36 MHz is pushing it, you'll notice the edges are rounded. To verify the full 72 MHz you'd need to check the SWS bits in RCC_CFGR via the debugger, or use `RCC_GetSysClockFreq()` which reads the actual register values.
+**TX (polling).** `SendChar` blocks until the hardware TX register is empty (`TXE=1`), writes the byte into `DR`, and waits until the last bit has physically left the pin (`TC=1`). `TXE` clears as soon as the byte moves from DR into the shift register — for back-to-back sending that's enough. `TC` waiting only matters for the last byte in a burst (e.g. before flipping RS-485 direction or entering sleep mode).
 
-## How to verify
+**RX (interrupt + ring buffer).** `RXNEIE` is enabled in `CR1`, so `USART2_IRQHandler` fires the moment a byte lands in DR. The ISR reads DR (which clears `RXNE`) and pushes the byte into the ring buffer:
 
-| Method | What to check |
-|--------|--------------|
-| LED blink | PC13 blinks at ~1 Hz = 72 MHz OK. Much slower = still on 8 MHz HSI |
-| MCO (PA8) | Scope should show ~36 MHz (PLL/2). Waveform won't be a clean square — that's the pin speed limit, not a clock problem |
-| Debugger | Add `actual_freq` to watch window. Should read 72000000 |
-| `RCC_GetSysClockFreq()` | Returns SYSCLK decoded from SWS + PLLMULL registers |
+```
+     head (ISR writes here)
+     v
+[ H  E  L  L  O  .  .  . ]
+ ^
+ tail (main reads here)
+```
 
-## APB1 note
+`head` and `tail` are both `volatile uint16_t`. The ISR only ever writes `head`, main only ever writes `tail` — single-producer, single-consumer, so no mutex or `__disable_irq()` needed. If the buffer fills up (next head would collide with tail), the incoming byte is dropped rather than overwriting the oldest one. For a 9600 baud terminal the main loop drains the buffer fast enough that overflow never happens.
 
-APB1 max is 36 MHz. Don't set the prescaler to ÷1 at 72 MHz or you'll overclock the APB1 peripherals (UART2/3, I2C, CAN, SPI2).
+**Why interrupt for RX and polling for TX?** You control *when* a byte gets sent — it's your code calling `SendChar`, so blocking briefly on `TXE` is fine. You don't control when a byte arrives — if the CPU is busy doing something else and you miss the narrow window after `RXNE` sets, the next incoming byte overwrites the old one in DR and you get an overrun (`ORE` flag, data lost). An interrupt is the only way to guarantee you catch every byte.
 
-Timer clock quirk: when APB1 prescaler ≠ 1, the timer clocks get doubled automatically. So TIM2/3/4 still run at 72 MHz even though PCLK1 is 36 MHz.
+## Overrun — the thing everyone hits once
+
+If the ISR is too slow or interrupts are disabled too long:
+
+```
+byte 'A' arrives -> DR = 'A', RXNE = 1
+(CPU still busy...)
+byte 'B' arrives -> DR = 'B', ORE = 1   <- 'A' is gone forever
+```
+
+Prevention is really just: keep the ISR short (read DR, push to buffer, return — no delays, no prints, no heavy work), and don't sit with interrupts disabled. The driver follows both rules.
+
+## GPIO config (F1 style)
+
+F1 packs direction and function into 4 bits per pin in `CRL`/`CRH`:
+
+- **PA2 (TX):** `MODE = 11` (50 MHz output) + `CNF = 10` (alternate function push-pull). The USART2 hardware drives the pin — your code never writes PA2's ODR.
+- **PA3 (RX):** `MODE = 00` (input) + `CNF = 01` (floating input). The external device drives the line; we just listen.
+
+Push-pull (not open-drain) for TX because UART is point-to-point and the line idles HIGH — push-pull gives a clean HIGH without needing external pull-ups.
+
+## F1 vs F4 — what actually changes for UART
+
+| | F103 | F446 |
+|---|---|---|
+| APB1 clock | 36 MHz | 45 MHz |
+| BRR for 9600 | `0x0EA6` | `0x124F` |
+| GPIO regs | CRL/CRH | MODER/OTYPER/OSPEEDR/PUPDR/AFR |
+| GPIO bus | APB2 | AHB1 |
+| AF mux | fixed (or AFIO remap) | explicit AF7 in AFR |
+| RX pin mode | "floating input" | AF mode (same as TX) |
+| SR/DR/CR1/BRR | — | identical |
+
+The USART peripheral itself is the same. Only the GPIO wiring around it differs. BRR computation is the same formula, just with a different clock.
+
+## Gotchas
+
+- **Writing BRR while UE=1** — undefined behavior. Always `CR1 = 0` first, set BRR, then enable UE + TE + RE.
+- **Heavy work in the ISR** — don't call `SendString`, don't `delay_ms`. Read DR, push, return.
+- **Forgetting to read DR in the ISR** — `RXNE` stays set, the interrupt re-fires immediately on return, you sit in a tight ISR loop forever.
+- **Baud mismatch** — 2-3% is tolerable, more than that and the receiver samples at the wrong time and you get framing errors + garbage.
+- **Misnamed ISR symbol** — if the handler in the .c file isn't exactly `USART2_IRQHandler`, the linker silently keeps the weak `Default_Handler` from the startup file and RX looks completely dead. Match the startup file name exactly.
+
+## Test
+
+1. Wire USB-TTL adapter (PA2→RX, PA3→TX, GND→GND)
+2. Open a terminal at **9600 8N1** on the adapter's COM port
+3. Flash and reset the board
+4. You should see:
+   ```
+   UART Ready!
+   Type something, it will echo back.
+   ```
+5. Type characters — they echo back, PC13 LED toggles on each byte
+6. Press **Enter** — the board responds with `You pressed Enter!`
 
 ## Build
 
-STM32CubeIDE project. Open, build, flash. No external dependencies beyond CMSIS headers.
-
-## References
-
-- RM0008 Reference Manual — Sec 7 (RCC), Sec 3 (Flash)
-- STM32F103x6 Datasheet
+STM32CubeIDE bare-metal project for STM32F103C6Tx (or C8Tx). No HAL. Drop the driver pair + `main.c` into `Inc/` and `Src/`. Pull in the RCC driver from `F1_RCC_Clock_Config`. Delete the auto-generated `main.c` that CubeIDE creates before copying mine in — duplicate symbols will break the link otherwise.
